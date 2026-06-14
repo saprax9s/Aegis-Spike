@@ -12,9 +12,9 @@ Aegis-Spike operates as a three-component distributed system:
 
 ```mermaid
 graph TD
-    A["OS Monitored Sandbox"] -->|File & Process Telemetry| B["OS Ingestion Client (ingest_client.py)"]
-    B -->|WebSocket Binary Spike Stream (50ms window)| C["Neuromorphic Backend (main.py)"]
-    C -->|LIF Inference Potentials / Entropy / Sparsity| D["React Dashboard Console (App.jsx)"]
+    A["OS Monitored Sandbox"] -->|File & Process Telemetry| B["OS Ingestion Client - ingest_client.py"]
+    B -->|WebSocket Binary Spike Stream - 50ms window| C["Neuromorphic Backend - main.py"]
+    C -->|LIF Inference Potentials / Entropy / Sparsity| D["React Dashboard Console - App.jsx"]
     C -->|Lockdown Trigger Command| B
     B -->|Process Isolation & Quarantine Actions| A
 ```
