@@ -28,8 +28,10 @@ engine = NeuromorphicEngine()
 
 # Keep track of active dashboard connections and client connections
 dashboard_sockets: Set[WebSocket] = set()
+active_client_socket = None  # Reference to the active client connection
 lockdown_active = False
 simulation_running = False
+restoring_active = False
 
 class StatusResponse(BaseModel):
     lockdown: bool
@@ -82,7 +84,11 @@ async def broadcast_to_dashboards(data: dict):
         dashboard_sockets.remove(ws)
 
 async def handle_processed_step(input_vector, simulated_latency=None, filepath="", process=""):
-    global lockdown_active
+    global lockdown_active, restoring_active
+    
+    if restoring_active:
+        return
+        
     t0 = time.perf_counter()
     # Process the step
     metrics = engine.process_step(input_vector)
@@ -96,6 +102,16 @@ async def handle_processed_step(input_vector, simulated_latency=None, filepath="
     # Check if lockdown is triggered
     if metrics["alert_triggered"]:
         lockdown_active = True
+        # Send lockdown command to the ingestion client
+        if active_client_socket:
+            try:
+                await active_client_socket.send_json({
+                    "action": "lockdown",
+                    "process": process,
+                    "filepath": filepath
+                })
+            except Exception as e:
+                print(f"Error sending containment instruction to client: {e}")
         
     metrics["lockdown"] = lockdown_active
     metrics["type"] = "metrics"
@@ -128,7 +144,7 @@ async def run_ransomware_burst():
         # Continuous high activity pattern (95% chance of spikes)
         file_io_spike = 1 if random.random() < 0.95 else 0
         thread_spike = 1 if random.random() < 0.95 else 0
-        pulse = [file_io_spike, thread_spike]
+        pulse = [file_io_spike, thread_spike, 0, 0, 0]
         
         filepath = f"C:\\Users\\Sapra\\Documents\\sensitive_file_{i}.xlsx" if file_io_spike else ""
         process = "ransomware_burst.exe" if thread_spike else ""
@@ -172,6 +188,9 @@ def get_files():
 
 @app.post("/api/generate-files")
 async def generate_files():
+    global restoring_active
+    restoring_active = True
+    engine.reset()
     if not os.path.exists(MONITORED_DIR):
         os.makedirs(MONITORED_DIR)
         
@@ -366,7 +385,7 @@ async def generate_files():
     for name, content in file_contents.items():
         full_path = os.path.join(MONITORED_DIR, name)
         try:
-            with open(full_path, "w") as f:
+            with open(full_path, "w", encoding="utf-8") as f:
                 f.write(content)
         except Exception as e:
             print(f"Error generating file {name}: {e}")
@@ -375,6 +394,16 @@ async def generate_files():
         "type": "files_update",
         "files": get_files()["files"]
     }))
+    
+    # Wait for file spikes to settle, then reset SNN engine and clear the flag
+    async def settle_generate():
+        global restoring_active
+        await asyncio.sleep(1.0)
+        engine.reset()
+        restoring_active = False
+        print("File generation settling complete. Engine reset and active.")
+        
+    asyncio.create_task(settle_generate())
     
     return {"status": "ok", "message": "Generated 20 clean test files in monitored directory."}
 
@@ -430,10 +459,11 @@ async def run_profiled_attack(profile: str):
             
             try:
                 if os.path.exists(old_path):
-                    with open(old_path, "r") as f:
+                    with open(old_path, "rb") as f:
                         content = f.read()
-                    with open(new_path, "w") as f:
-                        f.write(f"ENCRYPTED_BY_RANSOMWARE_SIMULATION_{random.randint(1000, 9999)}\n" + content[::-1])
+                    with open(new_path, "wb") as f:
+                        prefix = f"ENCRYPTED_BY_RANSOMWARE_SIMULATION_{random.randint(1000, 9999)}\n".encode('utf-8')
+                        f.write(prefix + content[::-1])
                     os.remove(old_path)
                     
                     await broadcast_to_dashboards({
@@ -446,7 +476,7 @@ async def run_profiled_attack(profile: str):
                         "files": get_files()["files"]
                     })
                     
-                    await handle_processed_step([1, 1], filepath=old_path, process="cryptowrecker.exe")
+                    await handle_processed_step([1, 1, 0, 0, 0], filepath=old_path, process="cryptowrecker.exe")
             except Exception as e:
                 print(f"Error encrypting file: {e}")
                 
@@ -467,7 +497,7 @@ async def run_profiled_attack(profile: str):
             file_path = os.path.join(MONITORED_DIR, file)
             try:
                 if os.path.exists(file_path):
-                    with open(file_path, "r") as f:
+                    with open(file_path, "rb") as f:
                         _ = f.read()
                         
                     await broadcast_to_dashboards({
@@ -475,7 +505,7 @@ async def run_profiled_attack(profile: str):
                         "message": f"ATTACKER: Harvested sensitive data from {file}"
                     })
                     
-                    await handle_processed_step([1, 0], filepath=file_path, process="spyharvest.dll")
+                    await handle_processed_step([1, 0, 1, 1, 0], filepath=file_path, process="spyharvest.dll")
             except Exception as e:
                 print(f"Error reading file: {e}")
                 
@@ -496,7 +526,7 @@ async def run_profiled_attack(profile: str):
                 "message": f"ATTACKER: Forked child process [PID: {random.randint(1000, 9999)}] -> Thread count: {i*8 + 10}"
             })
             
-            await handle_processed_step([0, 1], filepath="", process="process_spawn.sh")
+            await handle_processed_step([0, 1, 0, 0, 0], filepath="", process="process_spawn.sh")
             
             interval = max(0.01, interval * 0.85)
             await asyncio.sleep(interval)
@@ -519,10 +549,11 @@ async def run_profiled_attack(profile: str):
             
             try:
                 if os.path.exists(old_path):
-                    with open(old_path, "r") as f:
+                    with open(old_path, "rb") as f:
                         content = f.read()
-                    with open(new_path, "w") as f:
-                        f.write(f"ENCRYPTED_BY_DELAYED_CRYPTO_SIMULATION_{random.randint(1000, 9999)}\n" + content[::-1])
+                    with open(new_path, "wb") as f:
+                        prefix = f"ENCRYPTED_BY_DELAYED_CRYPTO_SIMULATION_{random.randint(1000, 9999)}\n".encode('utf-8')
+                        f.write(prefix + content[::-1])
                     os.remove(old_path)
                     
                     await broadcast_to_dashboards({
@@ -535,7 +566,7 @@ async def run_profiled_attack(profile: str):
                         "files": get_files()["files"]
                     })
                     
-                    await handle_processed_step([1, 1], filepath=old_path, process="delayed_crypto.exe")
+                    await handle_processed_step([1, 1, 0, 0, 0], filepath=old_path, process="delayed_crypto.exe")
             except Exception as e:
                 print(f"Error encrypting file: {e}")
                 
@@ -554,7 +585,7 @@ async def run_profiled_attack(profile: str):
                 "type": "log",
                 "message": f"ATTACKER: dropper.exe executing setup subprocess {i+1}/5..."
             })
-            await handle_processed_step([0, 1], filepath="", process="dropper.exe")
+            await handle_processed_step([0, 1, 1, 0, 1], filepath="", process="dropper.exe")
             await asyncio.sleep(0.1)
             
         # 15 rapid file spikes representing unpacking/dropping of binary payloads
@@ -569,7 +600,7 @@ async def run_profiled_attack(profile: str):
                 payload_name = f"extracted_payload_{i+1}.bin"
                 payload_path = os.path.join(MONITORED_DIR, payload_name)
                 try:
-                    with open(payload_path, "w") as f:
+                    with open(payload_path, "w", encoding="utf-8") as f:
                         f.write(f"MZ_MOCK_PAYLOAD_DATA_{random.randint(1000, 9999)}")
                     await broadcast_to_dashboards({
                         "type": "log",
@@ -579,7 +610,7 @@ async def run_profiled_attack(profile: str):
                         "type": "files_update",
                         "files": get_files()["files"]
                     })
-                    await handle_processed_step([1, 0], filepath=payload_path, process="dropper.exe")
+                    await handle_processed_step([1, 0, 0, 0, 0], filepath=payload_path, process="dropper.exe")
                 except Exception as e:
                     print(f"Error dropping file: {e}")
                 await asyncio.sleep(0.1)
@@ -597,18 +628,111 @@ async def run_profiled_attack(profile: str):
                 "type": "log",
                 "message": f"ATTACKER: net_worm.exe replicating connection socket thread {i+1}/30 on port {random.randint(1024, 65535)}"
             })
-            await handle_processed_step([0, 1], filepath="", process="net_worm.exe")
+            await handle_processed_step([0, 1, 1, 0, 0], filepath="", process="net_worm.exe")
             await asyncio.sleep(0.15)
+            
+    elif profile == "masquerading":
+        # Spawns a process pretending to be explorer.exe
+        # For the first 10 steps, it does nothing or minor benign events
+        # Then it suddenly shifts behavior and begins encrypting files rapidly [1, 1]
+        files_to_encrypt = [f for f in os.listdir(MONITORED_DIR) if not f.endswith(".locked")]
+        random.shuffle(files_to_encrypt)
+        
+        await broadcast_to_dashboards({
+            "type": "log",
+            "message": "ATTACKER: explorer.exe (PID 4992) running normally..."
+        })
+        for i in range(10):
+            if lockdown_active:
+                break
+            await handle_processed_step([0, 0, 0, 0, 0], filepath="", process="explorer.exe")
+            await asyncio.sleep(0.1)
+            
+        await broadcast_to_dashboards({
+            "type": "log",
+            "message": "ATTACKER: explorer.exe (PID 4992) suddenly spawned background thread and initiated file mutations!"
+        })
+        for file in files_to_encrypt:
+            if lockdown_active:
+                await broadcast_to_dashboards({
+                    "type": "log",
+                    "message": "!!! EDR LOCKDOWN SHIELD ENGAGED !!! masqueraded explorer.exe process suspended."
+                })
+                break
+                
+            old_path = os.path.join(MONITORED_DIR, file)
+            new_path = os.path.join(MONITORED_DIR, f"{file}.locked")
+            
+            try:
+                if os.path.exists(old_path):
+                    with open(old_path, "rb") as f:
+                        content = f.read()
+                    with open(new_path, "wb") as f:
+                        prefix = f"ENCRYPTED_BY_MASQUERADING_{random.randint(1000, 9999)}\n".encode('utf-8')
+                        f.write(prefix + content[::-1])
+                    os.remove(old_path)
+                    
+                    await broadcast_to_dashboards({
+                        "type": "log",
+                        "message": f"ATTACKER (explorer.exe): Encrypted {file}"
+                    })
+                    
+                    await broadcast_to_dashboards({
+                        "type": "files_update",
+                        "files": get_files()["files"]
+                    })
+                    
+                    await handle_processed_step([1, 1, 0, 1, 0], filepath=old_path, process="explorer.exe")
+            except Exception as e:
+                print(f"Error encrypting file: {e}")
+                
+            await asyncio.sleep(0.12)
+            
+    elif profile == "lotl":
+        # High volume but rhythmic: PowerShell running backup compressions
+        # Sending [1, 0] at very steady 100ms intervals.
+        # Entropy and Z-score should remain stable enough to NOT trigger lockdown.
+        for i in range(40):
+            if lockdown_active:
+                await broadcast_to_dashboards({
+                    "type": "log",
+                    "message": "!!! EDR LOCKDOWN SHIELD ENGAGED !!! powershell.exe script blocked (False Positive!)."
+                })
+                break
+            await broadcast_to_dashboards({
+                "type": "log",
+                "message": f"ADMINISTRATIVE: powershell.exe archiving log batch {i+1}/40..."
+            })
+            await handle_processed_step([1, 0, 0, 0, 1], filepath="", process="powershell.exe")
+            await asyncio.sleep(0.1)
+            
+    elif profile == "memory_injection":
+        # Rapid process thread spikes ([0, 1]) without file activity
+        for i in range(25):
+            if lockdown_active:
+                await broadcast_to_dashboards({
+                    "type": "log",
+                    "message": "!!! EDR LOCKDOWN SHIELD ENGAGED !!! svchost.exe injection thread pool terminated."
+                })
+                break
+            await broadcast_to_dashboards({
+                "type": "log",
+                "message": f"ATTACKER: svchost.exe injected thread pool executing shellcode segment {i+1}/25"
+            })
+            await handle_processed_step([0, 1, 0, 1, 0], filepath="", process="svchost.exe")
+            await asyncio.sleep(0.05)
             
     attack_running = False
 
 @app.post("/api/restore-files")
 async def post_restore_files():
-    global lockdown_active
+    global lockdown_active, restoring_active
     lockdown_active = False
+    restoring_active = True
     engine.reset()
     
     if not os.path.exists(MONITORED_DIR):
+        restoring_active = False
         return {"status": "ok", "message": "Nothing to restore."}
         
     restored_count = 0
@@ -621,14 +745,17 @@ async def post_restore_files():
                 original_path = os.path.join(MONITORED_DIR, original_name)
                 
                 if os.path.exists(file_path):
-                    with open(file_path, "r") as f:
-                        lines = f.readlines()
-                    if len(lines) > 1:
-                        restored_content = "".join(lines[1:])[::-1]
+                    with open(file_path, "rb") as f:
+                        data = f.read()
+                    
+                    # Split by the first newline byte to get the content bytes
+                    first_newline_idx = data.find(b"\n")
+                    if first_newline_idx != -1:
+                        restored_content = data[first_newline_idx+1:][::-1]
                     else:
-                        restored_content = "AEGIS-SPIKE RESTORED DATA"
+                        restored_content = b"AEGIS-SPIKE RESTORED DATA"
                         
-                    with open(original_path, "w") as f:
+                    with open(original_path, "wb") as f:
                         f.write(restored_content)
                     os.remove(file_path)
                     restored_count += 1
@@ -647,23 +774,50 @@ async def post_restore_files():
         "files": get_files()["files"]
     }))
     
+    # Wait for file spikes to settle, then reset SNN engine and clear the flag
+    async def settle_restore():
+        global restoring_active
+        await asyncio.sleep(1.0)
+        engine.reset()
+        restoring_active = False
+        print("Restoration settling complete. Engine reset and active.")
+        
+    asyncio.create_task(settle_restore())
+    
     return {"status": "ok", "message": f"Restored {restored_count} files back to clean state. EDR Reset."}
 
 @app.websocket("/ws/client")
 async def websocket_client(websocket: WebSocket):
+    global active_client_socket
     await websocket.accept()
+    active_client_socket = websocket
     print("Ingestion client connected.")
     try:
         while True:
             data = await websocket.receive_json()
-            pulse_vector = [0, 0]
+            pulse_vector = [0, 0, 0, 0, 0]
             filepath = ""
             process = ""
             
-            if isinstance(data, list) and len(data) == 2:
-                pulse_vector = data
+            if isinstance(data, list):
+                if len(data) == 5:
+                    pulse_vector = data
+                elif len(data) == 2:
+                    pulse_vector = data + [0, 0, 0]
             elif isinstance(data, dict):
-                pulse_vector = data.get("spike", [0, 0])
+                # Intercept containment reports
+                if data.get("type") == "containment_report":
+                    # Broadcast directly to dashboard and write visually to logs
+                    await broadcast_to_dashboards(data)
+                    await broadcast_to_dashboards({
+                        "type": "log",
+                        "message": f"!!! CONTAINMENT REPORT: Status={data.get('status').upper()} | Details={data.get('details')}"
+                    })
+                    continue
+                
+                pulse_vector = data.get("spike", [0, 0, 0, 0, 0])
+                if len(pulse_vector) == 2:
+                    pulse_vector = pulse_vector + [0, 0, 0]
                 filepath = data.get("filepath", "")
                 process = data.get("process", "")
             else:
@@ -690,6 +844,9 @@ async def websocket_client(websocket: WebSocket):
         print("Ingestion client disconnected.")
     except Exception as e:
         print(f"Error in client WebSocket: {e}")
+    finally:
+        if active_client_socket == websocket:
+            active_client_socket = None
 
 @app.websocket("/ws/dashboard")
 async def websocket_dashboard(websocket: WebSocket):

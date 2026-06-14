@@ -7,17 +7,20 @@ import math
 from collections import deque
 
 class AegisSNN(nn.Module):
-    def __init__(self, input_dim=2, hidden_dim=16, output_dim=2, beta=0.85):
+    def __init__(self, input_dim=5, hidden_dim=16, output_dim=5, beta=0.85):
         super().__init__()
-        self.beta = beta
         self.spike_grad = surrogate.fast_sigmoid(slope=25)
+        
+        # Heterogeneous Membrane Time Constants optimized to prevent saturation (0.60 to 0.90)
+        self.register_buffer('beta1', torch.linspace(0.60, 0.90, hidden_dim))
+        self.beta2 = 0.85
         
         # SNN Network Layers
         self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.lif1 = snn.Leaky(beta=self.beta, spike_grad=self.spike_grad)
+        self.lif1 = snn.Leaky(beta=self.beta1, spike_grad=self.spike_grad)
         
         self.fc2 = nn.Linear(hidden_dim, output_dim)
-        self.lif2 = snn.Leaky(beta=self.beta, spike_grad=self.spike_grad)
+        self.lif2 = snn.Leaky(beta=self.beta2, spike_grad=self.spike_grad)
         
         # State variables for LIF membrane potentials (kept for compatibility, though we track externally)
         self.mem1 = None
@@ -70,7 +73,7 @@ class AegisSNN(nn.Module):
 
 
 class NeuromorphicEngine:
-    def __init__(self, input_dim=2, hidden_dim=16, output_dim=2, learning_rate=0.01, window_size=100, calibration_size=200):
+    def __init__(self, input_dim=5, hidden_dim=16, output_dim=5, learning_rate=0.01, window_size=100, calibration_size=200):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = AegisSNN(input_dim, hidden_dim, output_dim).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
@@ -97,6 +100,8 @@ class NeuromorphicEngine:
         # Statistical baseline metrics
         self.mean_mem = None
         self.std_mem = None
+        self.cov_mem = None
+        self.inv_cov_mem = None
         
         # Cache for next step prediction online training
         self.prev_input = None
@@ -105,11 +110,16 @@ class NeuromorphicEngine:
         # Rolling prediction errors to smooth out anomalies
         self.rolling_errors = deque(maxlen=20)
         
+        # Calibration phase lists for dynamic thresholds calculation
+        self.calibration_pred_errors = []
+        self.calibration_entropies = []
+        
         # Baselines for alert triggers
         self.baseline_pred_error = 0.15
         self.error_threshold_multiplier = 3.0  # Alert if error > threshold * baseline
-        self.z_score_threshold = 4.0          # Alert if mean absolute Z-score > 4.0
+        self.z_score_threshold = 8.0           # Alert if Mahalanobis distance > 8.0
         self.entropy_deviation_threshold = 0.4 # Alert if entropy differs significantly from calibration
+        self.error_limit = 0.45                # Dynamic error limit threshold
         
         self.calibrated_entropy_mean = 0.0
         self.calibrated_entropy_std = 1.0
@@ -126,17 +136,18 @@ class NeuromorphicEngine:
         
         history_arr = np.array(spike_history) # shape (W, D)
         W, D = history_arr.shape
-        entropies = []
         
-        for d in range(D):
-            p = np.sum(history_arr[:, d]) / W
-            if p <= 0.0 or p >= 1.0:
-                h = 0.0
-            else:
-                h = -p * math.log2(p) - (1.0 - p) * math.log2(1.0 - p)
-            entropies.append(h)
-            
-        return float(np.mean(entropies))
+        # Calculate joint probability of each unique binary state vector
+        from collections import Counter
+        state_counts = Counter(tuple(row) for row in history_arr)
+        
+        entropy = 0.0
+        for count in state_counts.values():
+            p = count / W
+            if p > 0.0:
+                entropy -= p * math.log2(p)
+                
+        return float(entropy)
 
     def update_calibration(self):
         """Calibrate the baseline membrane potentials and entropy."""
@@ -149,15 +160,44 @@ class NeuromorphicEngine:
         # Prevent division by zero
         self.std_mem[self.std_mem < 1e-4] = 1e-4
         
-        # Also calibrate entropy baseline
-        # We look at rolling input + output entropy
-        entropy_vals = []
-        # Simulate rolling computations
-        history_len = len(self.input_spike_history)
-        if history_len >= 10:
-            input_ent = self.calculate_shannon_entropy(self.input_spike_history)
-            output_ent = self.calculate_shannon_entropy(self.output_spike_history)
-            self.calibrated_entropy_mean = (input_ent + output_ent) / 2.0
+        # Calculate covariance matrix for Mahalanobis Distance
+        self.cov_mem = np.cov(mems_arr, rowvar=False)
+        # Regularization to prevent matrix singularity and stabilize low-variance dimensions
+        self.cov_mem += np.eye(self.cov_mem.shape[0]) * 0.1
+        self.inv_cov_mem = np.linalg.inv(self.cov_mem)
+        
+        # Back-calculate Z-scores (Mahalanobis distances) for the calibration data to determine dynamic bounds
+        calib_z_scores = []
+        for mem_c in self.membrane_history:
+            diff = mem_c - self.mean_mem
+            mahalanobis_dist = np.sqrt(np.dot(np.dot(diff, self.inv_cov_mem), diff.T))
+            calib_z_scores.append(mahalanobis_dist)
+        mean_z = np.mean(calib_z_scores) if calib_z_scores else 0.0
+        std_z = np.std(calib_z_scores) if calib_z_scores else 1.0
+        
+        # Dynamic Z-score threshold
+        self.z_score_threshold = max(11.0, float(mean_z + 4.5 * std_z))
+        
+        # Calibrate prediction error dynamically
+        if self.calibration_pred_errors:
+            self.baseline_pred_error = float(np.mean(self.calibration_pred_errors))
+            pred_error_std = float(np.std(self.calibration_pred_errors))
+            self.error_limit = max(0.40, self.baseline_pred_error + 4.0 * pred_error_std)
+        else:
+            self.baseline_pred_error = 0.15
+            self.error_limit = 0.45
+            
+        # Also calibrate entropy baseline and deviation dynamically
+        if self.calibration_entropies:
+            self.calibrated_entropy_mean = float(np.mean(self.calibration_entropies))
+            entropy_std = float(np.std(self.calibration_entropies))
+            self.entropy_deviation_threshold = max(0.35, float(4.5 * entropy_std))
+        else:
+            # We look at rolling input entropy as a backup
+            history_len = len(self.input_spike_history)
+            if history_len >= 10:
+                self.calibrated_entropy_mean = self.calculate_shannon_entropy(self.input_spike_history)
+            self.entropy_deviation_threshold = 0.4
             
         self.calibrated = True
         return True
@@ -233,11 +273,7 @@ class NeuromorphicEngine:
         
         # Store membrane potentials of this step for calibration/Z-score
         mem_combined = np.concatenate([next_mem1.cpu().numpy()[0], next_mem2.cpu().numpy()[0]])
-        if not self.calibrated:
-            self.membrane_history.append(mem_combined)
-            if len(self.membrane_history) >= self.calibration_size:
-                self.update_calibration()
-                
+        
         # Store output spikes
         output_vector = spk2.cpu().numpy()[0]
         self.output_spike_history.append(output_vector)
@@ -245,11 +281,12 @@ class NeuromorphicEngine:
         # Calculate Rolling Entropy
         entropy = self.calculate_shannon_entropy(self.input_spike_history)
         
-        # Calculate Z-Score Deviation
+        # Calculate Z-Score Deviation using Mahalanobis Distance
         z_score_dev = 0.0
         if self.calibrated:
-            z_scores = np.abs((mem_combined - self.mean_mem) / self.std_mem)
-            z_score_dev = float(np.mean(z_scores))
+            diff = mem_combined - self.mean_mem
+            mahalanobis_dist = np.sqrt(np.dot(np.dot(diff, self.inv_cov_mem), diff.T))
+            z_score_dev = float(mahalanobis_dist)
             
         # 4. Calculate Prediction Error for this step using the PREVIOUS step's prediction
         pred_error = 0.0
@@ -266,28 +303,49 @@ class NeuromorphicEngine:
         
         self.prev_input = input_vector
         
-        # 5. Alert Decision Logic (CRITICAL GUARDRAILS)
+        # Collect calibration data if not calibrated
+        if not self.calibrated:
+            self.membrane_history.append(mem_combined)
+            if len(self.input_spike_history) >= 10:
+                self.calibration_entropies.append(entropy)
+            if self.prev_input is not None and self.prev_prediction is not None:
+                self.calibration_pred_errors.append(pred_error)
+            
+            if len(self.membrane_history) >= self.calibration_size:
+                self.update_calibration()
+        
+        # 5. Alert Decision Logic (CRITICAL GUARDRAILS WITH DYNAMIC BOUNDS & REFINED CLASSIFICATION)
         # "The system only triggers an alert if the temporal sequence collapses (Prediction Error spikes) AND the statistical bounds are breached."
         alert_triggered = False
         if self.calibrated:
-            # Check if prediction error spikes (e.g. greater than a threshold)
-            # Standard baseline error is small. If it jumps by 3x or is > 0.4
-            error_spiked = avg_pred_error > (self.baseline_pred_error * self.error_threshold_multiplier) or avg_pred_error > 0.45
+            # Check if prediction error spikes (using dynamic baseline & limit)
+            error_spiked = avg_pred_error > (self.baseline_pred_error * self.error_threshold_multiplier) or avg_pred_error > self.error_limit
             
-            # Check if statistical bounds are breached
+            # Check if statistical bounds are breached dynamically
             z_score_breached = z_score_dev > self.z_score_threshold
             
             # Entropy collapses or expands violently
-            entropy_breached = abs(entropy - self.calibrated_entropy_mean) > self.entropy_deviation_threshold
+            entropy_breached = False
+            # Only evaluate entropy breach if the history has warmed up (len >= 20)
+            if len(self.input_spike_history) >= 20:
+                entropy_breached = abs(entropy - self.calibrated_entropy_mean) > self.entropy_deviation_threshold
             
-            # Alert condition: Error spikes AND (Z-score breached OR Entropy breached)
-            if error_spiked and (z_score_breached or entropy_breached):
-                alert_triggered = True
+            # Alert condition logic with dual warm-up gates:
+            # 1. Direct Z-Score deviation alarms with active telemetry can trigger after 5 steps
+            if len(self.input_spike_history) >= 5:
+                if z_score_breached and sum(input_vector) > 0:
+                    alert_triggered = True
+                    
+            # 2. Prediction error sequence collapse alerts trigger after 20 steps (to clear startup transients)
+            if len(self.input_spike_history) >= 20:
+                if error_spiked and (z_score_breached or entropy_breached):
+                    alert_triggered = True
                 
         return {
             "prediction_error": avg_pred_error,
             "shannon_entropy": entropy,
             "z_score_deviation": z_score_dev,
+            "z_score_threshold": self.z_score_threshold,
             "alert_triggered": alert_triggered,
             "sparsity": sparsity,
             "calibrated": self.calibrated,
@@ -312,4 +370,7 @@ class NeuromorphicEngine:
         self.rolling_errors.clear()
         self.prev_input = None
         self.prev_prediction = None
+        if not self.calibrated:
+            self.calibration_pred_errors.clear()
+            self.calibration_entropies.clear()
         # Keep calibration data unless explicit recalibration is requested

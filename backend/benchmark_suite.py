@@ -72,7 +72,10 @@ def plot_metrics(history, title, save_path, alert_idx=None):
     # 3. Z-Score Deviation Plot
     ax3.plot(steps, history["z_score"], color=COLORS["yellow"], linewidth=2, label='LIF Membrane Z-Score')
     ax3.set_ylabel('Z-Score Potential', color=COLORS["yellow"], fontweight='bold', fontsize=9)
-    ax3.axhline(4.0, color=COLORS["red"], linestyle='--', linewidth=1.5, label='Alarm Threshold (4.00)')
+    if "z_score_threshold" in history and len(history["z_score_threshold"]) > 0:
+        ax3.plot(steps, history["z_score_threshold"], color=COLORS["red"], linestyle='--', linewidth=1.5, label='Dynamic Threshold')
+    else:
+        ax3.axhline(14.0, color=COLORS["red"], linestyle='--', linewidth=1.5, label='Alarm Threshold (14.00)')
     ax3.set_xlabel('Simulation Step (50ms Window)', color=COLORS["text"], fontweight='bold', fontsize=9)
     ax3.legend(loc='upper right', framealpha=0.3, facecolor='#000000', labelcolor='#ffffff', fontsize=8)
     
@@ -108,8 +111,8 @@ This benchmarking ledger simulates three distinct zero-day malware execution vec
         f.write(f"""
 ## 3. Deep Synaptic Weight Status (FC1 Adapting Matrix)
 Surrogate gradient backpropagation adapts these values dynamically during online updates to block malicious pathways:
-* Excitatory Synapses (FC1 row 0): `{engine.model.fc1.weight.cpu().detach().numpy().tolist()[0]}`
-* Inhibitory Synapses (FC1 row 1): `{engine.model.fc1.weight.cpu().detach().numpy().tolist()[1]}`
+* Hidden Node 0 Synapses (FC1 Row 0): `{engine.model.fc1.weight.cpu().detach().numpy().tolist()[0]}`
+* Hidden Node 1 Synapses (FC1 Row 1): `{engine.model.fc1.weight.cpu().detach().numpy().tolist()[1]}`
 
 ## 4. Telemetry Analytics Graphs
 
@@ -137,6 +140,18 @@ Surrogate gradient backpropagation adapts these values dynamically during online
 *Steady socket/process thread surges representing replication.*
 ![Network Worm Telemetry Graph](net_worm_benchmark.png)
 
+### 4.7 Process Masquerading Profile (masquerading)
+*Benign processes that suddenly pivot to heavy write activity.*
+![Process Masquerading Telemetry Graph](masquerading_benchmark.png)
+
+### 4.8 Living off the Land Profile (lotl)
+*Rhythmic high-volume backup/archiving script activity.*
+![Living off the Land Telemetry Graph](lotl_benchmark.png)
+
+### 4.9 Memory Injection Profile (memory_injection)
+*Process hollowing manifesting as high-frequency thread spikes.*
+![Memory Injection Telemetry Graph](memory_injection_benchmark.png)
+
 ===================================================================
 AEGIS-SPIKE CLINICAL EDR BENCHMARK VERIFIED - PASS
 """)
@@ -154,7 +169,10 @@ def run_benchmark():
     for _ in range(120):
         file_spike = 1 if random.random() < 0.15 else 0
         thread_spike = 1 if random.random() < 0.10 else 0
-        engine.process_step([file_spike, thread_spike])
+        net_spike = 1 if random.random() < 0.05 else 0
+        priv_spike = 1 if random.random() < 0.01 else 0
+        script_spike = 1 if random.random() < 0.02 else 0
+        engine.process_step([file_spike, thread_spike, net_spike, priv_spike, script_spike])
         
     print(f"    SNN Calibration Status: {'SUCCESS' if engine.calibrated else 'FAILED'}")
     print(f"    Baseline Shannon Entropy: {engine.calibrated_entropy_mean:.4f}")
@@ -166,7 +184,10 @@ def run_benchmark():
         {"profile": "fork_bomb", "process": "process_spawn.sh"},
         {"profile": "delayed_crypto", "process": "delayed_crypto.exe"},
         {"profile": "dropper", "process": "dropper.exe"},
-        {"profile": "net_worm", "process": "net_worm.exe"}
+        {"profile": "net_worm", "process": "net_worm.exe"},
+        {"profile": "masquerading", "process": "explorer.exe"},
+        {"profile": "lotl", "process": "powershell.exe"},
+        {"profile": "memory_injection", "process": "svchost.exe"}
     ]
     benchmark_results = {}
     
@@ -182,7 +203,8 @@ def run_benchmark():
             "sparsity": [],
             "entropy": [],
             "z_score": [],
-            "calibrated_entropy": []
+            "calibrated_entropy": [],
+            "z_score_threshold": []
         }
         
         alert_idx = None
@@ -195,32 +217,41 @@ def run_benchmark():
         for idx in range(limit):
             # Generate stimulus footprint
             if profile == "ransomware":
-                stimulus = [1, 1]
+                stimulus = [1, 1, 0, 0, 0]
                 sleep_t = 0.01
             elif profile == "spyware":
-                stimulus = [1 if idx % 2 == 0 else 0, 0]
+                stimulus = [1 if idx % 2 == 0 else 0, 0, 1 if idx % 3 == 0 else 0, 1 if idx % 4 == 0 else 0, 0]
                 sleep_t = 0.05
             elif profile == "fork_bomb":
-                stimulus = [0, 1]
+                stimulus = [0, 1, 0, 0, 0]
                 sleep_t = interval
                 interval = max(0.01, interval * 0.85)
             elif profile == "delayed_crypto":
-                # Spikes are spaced out to simulate evasion
-                stimulus = [1, 1]
-                sleep_t = 0.08  # Run fast but keep trace
+                stimulus = [1, 1, 0, 0, 0]
+                sleep_t = 0.08
             elif profile == "dropper":
-                # 5 process spikes, then 15 file spikes
                 if idx < 5:
-                    stimulus = [0, 1]
+                    stimulus = [0, 1, 1, 0, 1]
                 elif idx < 20:
-                    stimulus = [1, 0]
+                    stimulus = [1, 0, 0, 0, 0]
                 else:
-                    stimulus = [0, 0]
+                    stimulus = [0, 0, 0, 0, 0]
                 sleep_t = 0.02
             elif profile == "net_worm":
-                # Continuous process/thread spikes
-                stimulus = [0, 1]
+                stimulus = [0, 1, 1, 0, 0]
                 sleep_t = 0.03
+            elif profile == "masquerading":
+                if idx < 10:
+                    stimulus = [0, 0, 0, 0, 0]
+                else:
+                    stimulus = [1, 1, 0, 1, 0]
+                sleep_t = 0.02
+            elif profile == "lotl":
+                stimulus = [1, 0, 0, 0, 1]
+                sleep_t = 0.04
+            elif profile == "memory_injection":
+                stimulus = [0, 1, 0, 1, 0]
+                sleep_t = 0.02
                 
             t0 = time.perf_counter()
             metrics = engine.process_step(stimulus)
@@ -230,6 +261,7 @@ def run_benchmark():
             history["entropy"].append(metrics["shannon_entropy"])
             history["z_score"].append(metrics["z_score_deviation"])
             history["calibrated_entropy"].append(engine.calibrated_entropy_mean)
+            history["z_score_threshold"].append(metrics.get("z_score_threshold", 14.0))
             
             if metrics["alert_triggered"] and alert_idx is None:
                 alert_idx = idx

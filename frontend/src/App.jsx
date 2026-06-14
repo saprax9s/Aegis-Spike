@@ -159,12 +159,17 @@ function App() {
   const [sparsity, setSparsity] = useState(100.0);
   const [entropy, setEntropy] = useState(0.0);
   const [zScore, setZScore] = useState(0.0);
+  const [zScoreThreshold, setZScoreThreshold] = useState(14.0);
   const [latency, setLatency] = useState(0.0);
   
   // Endpoint files state
   const [files, setFiles] = useState([]);
   const [attackingProcess, setAttackingProcess] = useState('');
   const [attackedFilePath, setAttackedFilePath] = useState('');
+  
+  // Active Alert Overlay Modal & Live Containment Report States
+  const [showAttackAlert, setShowAttackAlert] = useState(false);
+  const [containmentReport, setContainmentReport] = useState(null);
   
   // Simulation config
   const [attackProfile, setAttackProfile] = useState('ransomware');
@@ -188,10 +193,10 @@ function App() {
   const lastSNNDataRef = useRef({
     spk1: Array(16).fill(0),
     mem1: Array(16).fill(0),
-    spk2: Array(2).fill(0),
-    mem2: Array(2).fill(0),
-    weights_fc1: Array(16).fill().map(() => [0, 0]),
-    weights_fc2: Array(2).fill().map(() => Array(16).fill(0))
+    spk2: Array(5).fill(0),
+    mem2: Array(5).fill(0),
+    weights_fc1: Array(16).fill().map(() => [0, 0, 0, 0, 0]),
+    weights_fc2: Array(5).fill().map(() => Array(16).fill(0))
   });
   
   // API details
@@ -244,6 +249,9 @@ function App() {
             setLockdown(data.lockdown);
             setCalibrated(data.calibrated);
             setCalibrationProgress(data.calibration_progress);
+            if (data.z_score_threshold) {
+              setZScoreThreshold(data.z_score_threshold);
+            }
             if (data.files) {
               setFiles(data.files);
             }
@@ -253,8 +261,11 @@ function App() {
             setLockdown(data.lockdown);
             setCalibrated(data.calibrated);
             setCalibrationProgress(data.calibration_progress);
+            setZScoreThreshold(data.z_score_threshold ?? 14.0);
             setAttackingProcess('');
             setAttackedFilePath('');
+            setShowAttackAlert(false);
+            setContainmentReport(null);
             if (data.files) {
               setFiles(data.files);
             }
@@ -265,10 +276,10 @@ function App() {
             lastSNNDataRef.current = {
               spk1: Array(16).fill(0),
               mem1: Array(16).fill(0),
-              spk2: Array(2).fill(0),
-              mem2: Array(2).fill(0),
-              weights_fc1: Array(16).fill().map(() => [0, 0]),
-              weights_fc2: Array(2).fill().map(() => Array(16).fill(0))
+              spk2: Array(5).fill(0),
+              mem2: Array(5).fill(0),
+              weights_fc1: Array(16).fill().map(() => [0, 0, 0, 0, 0]),
+              weights_fc2: Array(5).fill().map(() => Array(16).fill(0))
             };
             
             drawSNNPlot(
@@ -278,7 +289,7 @@ function App() {
               lastSNNDataRef.current.mem2,
               lastSNNDataRef.current.weights_fc1,
               lastSNNDataRef.current.weights_fc2,
-              [0, 0]
+              [0, 0, 0, 0, 0]
             );
             drawHeatmapPlot(lastSNNDataRef.current.weights_fc1);
             
@@ -293,11 +304,20 @@ function App() {
               setFiles(data.files);
             }
           }
+          else if (data.type === 'containment_report') {
+            setContainmentReport(data);
+            setShowAttackAlert(true);
+            addLog(`🛡️ Containment action executed: status=${data.status.toUpperCase()} | Details: ${data.details}`);
+          }
           else if (data.type === 'metrics' || data.type === 'metrics_blocked') {
             // Update metrics
             setSparsity(data.sparsity ?? 100);
             setEntropy(data.shannon_entropy ?? 0);
             setZScore(data.z_score_deviation ?? 0);
+            const activeThreshold = data.z_score_threshold ?? zScoreThreshold;
+            if (data.z_score_threshold) {
+              setZScoreThreshold(data.z_score_threshold);
+            }
             setLatency(data.latency_us ?? 0);
             setLockdown(data.lockdown ?? false);
             setCalibrated(data.calibrated ?? false);
@@ -315,7 +335,7 @@ function App() {
             if (zScoreHistoryRef.current.length > 50) zScoreHistoryRef.current.shift();
             
             // Cache SNN structural data
-            const inputVector = data.input_vector || [0, 0];
+            const inputVector = data.input_vector || [0, 0, 0, 0, 0];
             lastSNNDataRef.current = {
               spk1: data.spk1 || lastSNNDataRef.current.spk1,
               mem1: data.mem1 || lastSNNDataRef.current.mem1,
@@ -327,7 +347,7 @@ function App() {
             
             // Render plots
             drawEntropyPlot();
-            drawZScorePlot();
+            drawZScorePlot(activeThreshold);
             drawSNNPlot(
               lastSNNDataRef.current.spk1,
               lastSNNDataRef.current.mem1,
@@ -342,6 +362,7 @@ function App() {
             if (data.alert_triggered) {
               SoundSynth.playSiren();
               setShowReport(true);
+              setShowAttackAlert(true);
               addLog(`🚨 NEUROMORPHIC ALARM: Spatial-temporal shift detected! Entropy: ${data.shannon_entropy.toFixed(3)} | Z-Score: ${data.z_score_deviation.toFixed(2)} | Latency: ${data.latency_us.toFixed(1)} µs`, true);
             }
           }
@@ -404,7 +425,7 @@ function App() {
     ctx.fill();
   };
   
-  const drawZScorePlot = () => {
+  const drawZScorePlot = (zScoreThresholdVal) => {
     const canvas = zScoreCanvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -416,13 +437,16 @@ function App() {
     const history = zScoreHistoryRef.current;
     if (history.length < 2) return;
     
-    const maxVal = 8.0;
+    // Dynamic maxVal scaling based on history, dynamic threshold, and minimum floor
+    const currentThreshold = zScoreThresholdVal ?? zScoreThreshold ?? 14.0;
+    const maxVal = Math.max(currentThreshold, Math.max(...history), 1.0);
+    
     const points = history.map((val, idx) => ({
       x: (idx / (history.length - 1)) * width,
       y: height - ((Math.min(val, maxVal) / maxVal) * (height - 8)) - 4
     }));
     
-    const isHigh = zScore > 4.0;
+    const isHigh = zScore > currentThreshold;
     ctx.strokeStyle = isHigh ? COLORS.red : COLORS.yellow;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
@@ -454,8 +478,11 @@ function App() {
     const outputX = width * 0.88;
     
     const inputNodes = [
-      { name: 'FILE I/O', x: inputX, y: height * 0.35, active: input_vector[0] === 1, color: COLORS.green },
-      { name: 'THREADS', x: inputX, y: height * 0.65, active: input_vector[1] === 1, color: COLORS.cyan }
+      { name: 'FILE I/O', x: inputX, y: height * 0.15, active: input_vector[0] === 1, color: COLORS.green },
+      { name: 'THREADS', x: inputX, y: height * 0.325, active: input_vector[1] === 1, color: COLORS.cyan },
+      { name: 'NETWORK', x: inputX, y: height * 0.50, active: input_vector[2] === 1, color: COLORS.purple },
+      { name: 'PRIVILEGE', x: inputX, y: height * 0.675, active: input_vector[3] === 1, color: COLORS.yellow },
+      { name: 'SCRIPT EXEC', x: inputX, y: height * 0.85, active: input_vector[4] === 1, color: COLORS.red }
     ];
     
     const hiddenNodes = [];
@@ -471,14 +498,17 @@ function App() {
     }
     
     const outputNodes = [
-      { name: 'ANOMALY', x: outputX, y: height * 0.35, spike: spk2 ? spk2[0] === 1 : false, mem: mem2 ? mem2[0] : 0, color: COLORS.red },
-      { name: 'SPARSITY', x: outputX, y: height * 0.65, spike: spk2 ? spk2[1] === 1 : false, mem: mem2 ? mem2[1] : 0, color: COLORS.yellow }
+      { name: 'FILE_OUT', x: outputX, y: height * 0.15, spike: spk2 ? spk2[0] === 1 : false, mem: mem2 ? mem2[0] : 0, color: COLORS.green },
+      { name: 'THRD_OUT', x: outputX, y: height * 0.325, spike: spk2 ? spk2[1] === 1 : false, mem: mem2 ? mem2[1] : 0, color: COLORS.cyan },
+      { name: 'NET_OUT', x: outputX, y: height * 0.50, spike: spk2 ? spk2[2] === 1 : false, mem: mem2 ? mem2[2] : 0, color: COLORS.purple },
+      { name: 'PRIV_OUT', x: outputX, y: height * 0.675, spike: spk2 ? spk2[3] === 1 : false, mem: mem2 ? mem2[3] : 0, color: COLORS.yellow },
+      { name: 'SCR_OUT', x: outputX, y: height * 0.85, spike: spk2 ? spk2[4] === 1 : false, mem: mem2 ? mem2[4] : 0, color: COLORS.red }
     ];
     
     // Draw Synaptic Connections: Input -> Hidden
     if (w1) {
       for (let i = 0; i < numHidden; i++) {
-        for (let j = 0; j < 2; j++) {
+        for (let j = 0; j < 5; j++) {
           const weight = w1[i][j];
           const start = inputNodes[j];
           const end = hiddenNodes[i];
@@ -512,7 +542,7 @@ function App() {
     
     // Draw Synaptic Connections: Hidden -> Output
     if (w2) {
-      for (let k = 0; k < 2; k++) {
+      for (let k = 0; k < 5; k++) {
         for (let i = 0; i < numHidden; i++) {
           const weight = w2[k][i];
           const start = hiddenNodes[i];
@@ -563,7 +593,8 @@ function App() {
     // Draw Hidden LIF Reservoir Neurons
     hiddenNodes.forEach(node => {
       ctx.beginPath();
-      const r = Math.max(2.5, 4.5 + node.mem * 4);
+      // Cap hidden layer node sizes dynamically to prevent visual bloating on high potentials
+      const r = Math.max(2.5, Math.min(12.0, 4.5 + Math.abs(node.mem) * 1.5));
       ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
       
       if (node.spike) {
@@ -580,7 +611,7 @@ function App() {
         ctx.stroke();
         ctx.shadowBlur = 0;
       } else {
-        const fillAlpha = Math.min(1.0, 0.2 + node.mem * 0.7);
+        const fillAlpha = Math.min(1.0, 0.2 + Math.abs(node.mem) * 0.4);
         ctx.fillStyle = `rgba(0, 240, 255, ${fillAlpha})`;
         ctx.strokeStyle = 'rgba(0, 240, 255, 0.25)';
         ctx.lineWidth = 1;
@@ -619,7 +650,7 @@ function App() {
     if (!w1 || w1.length === 0) return;
     
     const numRows = 16;
-    const numCols = 2;
+    const numCols = 5;
     const cellWidth = width / numCols;
     const cellHeight = height / numRows;
     
@@ -647,12 +678,12 @@ function App() {
       lastSNNDataRef.current.mem2,
       lastSNNDataRef.current.weights_fc1,
       lastSNNDataRef.current.weights_fc2,
-      [0, 0]
+      [0, 0, 0, 0, 0]
     );
     drawHeatmapPlot(lastSNNDataRef.current.weights_fc1);
     drawEntropyPlot();
     drawZScorePlot();
-  }, [lockdown]);
+  }, [lockdown, zScoreThreshold]);
 
   // Command handlers
   const handleGenerateFiles = async () => {
@@ -699,6 +730,8 @@ function App() {
       setAttackingProcess('');
       setAttackedFilePath('');
       setShowReport(false);
+      setShowAttackAlert(false);
+      setContainmentReport(null);
       fetchFiles();
     } catch (e) {
       addLog("Failed to reach API endpoint /api/restore-files", true);
@@ -715,6 +748,8 @@ function App() {
       setAttackingProcess('');
       setAttackedFilePath('');
       setShowReport(false);
+      setShowAttackAlert(false);
+      setContainmentReport(null);
       fetchFiles();
     } catch (e) {
       addLog("Failed to reach API endpoint /api/reset", true);
@@ -760,7 +795,7 @@ The AEGIS-SPIKE Spiking Neural Network (SNN) engine detected a critical spatial-
 ## 3. Cognitive SNN Telemetry Data
 - Inference Firing Sparsity: ${sparsity.toFixed(1)}% (Inference Density)
 - Shannon Information Entropy: ${entropy.toFixed(4)} (Sequence Dispersion Limit Exceeded)
-- LIF Membrane potential Z-Score: ${zScore.toFixed(2)} (Statistical Bounds Limit: 4.00)
+- LIF Membrane potential Z-Score: ${zScore.toFixed(2)} (Statistical Bounds Limit: ${zScoreThreshold.toFixed(2)})
 
 ## 4. Endpoint Protection Statistics
 - Total Sandbox Target Files: ${totalFilesCount}
@@ -824,6 +859,9 @@ AEGIS-SPIKE COMMAND CENTER - THREAT INTEGRITY GUARANTEED
               <option value="delayed_crypto">Delayed Ransomware (delayed_crypto)</option>
               <option value="dropper">Trojan Dropper (dropper)</option>
               <option value="net_worm">Network Worm (net_worm)</option>
+              <option value="masquerading">Process Masquerading (explorer)</option>
+              <option value="lotl">Living off the Land (powershell)</option>
+              <option value="memory_injection">Memory Injection (svchost)</option>
             </select>
             <button className="btn btn-danger" onClick={handleSimulateAttack} style={{ borderTopLeftRadius: 0, borderBottomLeftRadius: 0 }}>
               💥 INJECT ATTACK
@@ -904,7 +942,7 @@ AEGIS-SPIKE COMMAND CENTER - THREAT INTEGRITY GUARANTEED
         </div>
         
         {/* Metric 3: Membrane Potential Deviation */}
-        <div className={`metric-card zscore ${zScore > 4.0 ? 'breached' : ''}`}>
+        <div className={`metric-card zscore ${zScore > zScoreThreshold ? 'breached' : ''}`}>
           <div className="metric-header">
             <span className="metric-title">LIF Potential Dev.</span>
             <span className="math-badge">Z(v)</span>
@@ -916,13 +954,13 @@ AEGIS-SPIKE COMMAND CENTER - THREAT INTEGRITY GUARANTEED
             <canvas ref={zScoreCanvasRef} />
           </div>
           <span className="metric-subtitle">
-            {zScore > 4.0 ? 'STATISTICAL BOUNDS BREACHED' : 'STABLE LIF BASIN'}
+            {zScore > zScoreThreshold ? 'STATISTICAL BOUNDS BREACHED' : 'STABLE LIF BASIN'}
           </span>
           
           <div className="math-tooltip">
             <strong>Z-Score Potential Deviation</strong>
             <span className="math-formula">{ZSCORE_FORMULA}</span>
-            Measures current LIF membrane potentials ($v_i$) against mean ($\mu_i$) and standard deviation ($\sigma_i$) calibrated values. Alert triggers when $Z &gt; 4.0$.
+            Measures current LIF membrane potentials ($v_i$) against mean ($\mu_i$) and standard deviation ($\sigma_i$) calibrated values. Alert triggers when $Z &gt; {zScoreThreshold.toFixed(1)}$.
           </div>
         </div>
         
@@ -970,11 +1008,23 @@ AEGIS-SPIKE COMMAND CENTER - THREAT INTEGRITY GUARANTEED
             </div>
             <div className="legend-item">
               <div className="legend-color" style={{ backgroundColor: COLORS.purple }} />
-              <span>Inhibitory Connection (w &lt; 0)</span>
+              <span>Network Spikes</span>
             </div>
             <div className="legend-item">
-              <div className="legend-color" style={{ backgroundColor: COLORS.green }} />
-              <span>Excitatory Connection (w &ge; 0)</span>
+              <div className="legend-color" style={{ backgroundColor: COLORS.yellow }} />
+              <span>Privilege Spikes</span>
+            </div>
+            <div className="legend-item">
+              <div className="legend-color" style={{ backgroundColor: COLORS.red }} />
+              <span>Script Spikes</span>
+            </div>
+            <div className="legend-item">
+              <div className="legend-color" style={{ backgroundColor: '#af40ff' }} />
+              <span>Inhibitory (w &lt; 0)</span>
+            </div>
+            <div className="legend-item">
+              <div className="legend-color" style={{ backgroundColor: '#00f0ff' }} />
+              <span>Excitatory (w &ge; 0)</span>
             </div>
           </div>
         </section>
@@ -983,7 +1033,7 @@ AEGIS-SPIKE COMMAND CENTER - THREAT INTEGRITY GUARANTEED
         <section className={`panel-container shield-panel ${lockdown ? 'lockdown' : ''}`}>
           <div className="panel-header">
             <div className={`panel-title shield-title ${lockdown ? 'lockdown' : ''}`}>
-              🖧 ENDPOINT FILE GRID: SANDBOX SANDBOX
+              🖧 ENDPOINT FILE GRID: SANDBOX
             </div>
             {lockdown && <button className="btn btn-warning btn-show-report" onClick={() => { SoundSynth.playClick(); setShowReport(true); }}>VIEW REPORT</button>}
           </div>
@@ -1076,17 +1126,17 @@ AEGIS-SPIKE COMMAND CENTER - THREAT INTEGRITY GUARANTEED
               </div>
             </div>
             
-            <div className={`diagnostic-row ${zScore > 4.0 ? 'breached' : ''}`}>
+            <div className={`diagnostic-row ${zScore > zScoreThreshold ? 'breached' : ''}`}>
               <div className="diag-title">
                 <span>SNN Entropy Bounds Check</span>
-                <span className={`status ${zScore > 4.0 ? 'breached' : 'normal'}`}>
-                  {zScore > 4.0 ? 'LIMIT BREACHED' : 'SAFE STATS BASIN'}
+                <span className={`status ${zScore > zScoreThreshold ? 'breached' : 'normal'}`}>
+                  {zScore > zScoreThreshold ? 'LIMIT BREACHED' : 'SAFE STATS BASIN'}
                 </span>
               </div>
               <div className="diag-bar-bg">
                 <div 
-                  className={`diag-bar-fill ${zScore > 4.0 ? 'breached' : zScore > 2.5 ? 'warning' : 'normal'}`} 
-                  style={{ width: `${Math.min(100, (zScore / 8.0) * 100)}%` }} 
+                  className={`diag-bar-fill ${zScore > zScoreThreshold ? 'breached' : zScore > (zScoreThreshold / 2.0) ? 'warning' : 'normal'}`} 
+                  style={{ width: `${Math.min(100, (zScore / zScoreThreshold) * 100)}%` }} 
                 />
               </div>
             </div>
@@ -1171,6 +1221,87 @@ AEGIS-SPIKE COMMAND CENTER - THREAT INTEGRITY GUARANTEED
               </button>
               <button className="btn btn-success" onClick={downloadReport}>
                 📥 DOWNLOAD MARKDOWN REPORT
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ATTACK DETECTED POPUP MODAL */}
+      {showAttackAlert && (
+        <div className="attack-alert-modal-overlay">
+          <div className="attack-alert-modal">
+            <div className="attack-alert-modal-header">
+              <div className="alert-badge">⚠️ ATTACK DETECTED! SYSTEM QUARANTINED!</div>
+              <button className="btn-close-alert-modal" onClick={() => { SoundSynth.playClick(); setShowAttackAlert(false); }}>&times;</button>
+            </div>
+            
+            <div className="attack-alert-modal-body">
+              <div className="pulse-shield-alert">
+                <div className="shield-warning-icon">☣</div>
+                <p className="glow-alert-text">AEGIS ACTIVE CONTAINMENT ENGAGED</p>
+              </div>
+              
+              <div className="alert-meta-box">
+                <div className="meta-row">
+                  <span className="lbl">Threat Profile:</span>
+                  <span className="val profile-val">{attackProfile.toUpperCase()}</span>
+                </div>
+                <div className="meta-row">
+                  <span className="lbl">Culprit Process:</span>
+                  <span className="val process-val">{attackingProcess || "unknown"}</span>
+                </div>
+                <div className="meta-row">
+                  <span className="lbl">Target File:</span>
+                  <span className="val file-val font-mono">{attackedFilePath || "none"}</span>
+                </div>
+                <div className="meta-row">
+                  <span className="lbl">SNN Clock Delay:</span>
+                  <span className="val">{latency.toFixed(1)} µs</span>
+                </div>
+              </div>
+
+              <div className="containment-status-box">
+                <h3>🛡️ Client Active Shield Status</h3>
+                {!containmentReport ? (
+                  <div className="containment-loading">
+                    <div className="loading-spinner" />
+                    <span>Awaiting active shield containment report from client...</span>
+                  </div>
+                ) : (
+                  <div className={`containment-details ${containmentReport.status}`}>
+                    <div className="status-header-row">
+                      <span className="lbl">Containment Status:</span>
+                      <span className={`status-badge ${containmentReport.status}`}>
+                        {containmentReport.status.toUpperCase()}
+                      </span>
+                    </div>
+                    
+                    <p className="containment-desc">{containmentReport.details}</p>
+                    
+                    {containmentReport.status === "access_denied" && (
+                      <div className="privilege-warning-alert">
+                        <strong>⚠️ Privilege Restriction Notice</strong>
+                        <p>
+                          The Aegis-Spike client was unable to terminate the threat or quarantine its files because it is running under a standard account. 
+                          To allow complete system defense against SYSTEM or Administrator accounts, please restart the ingestion client with elevated administrator rights.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+            
+            <div className="attack-alert-modal-footer">
+              <button className="btn btn-warning" onClick={() => { SoundSynth.playClick(); setShowAttackAlert(false); }}>
+                DISMISS ALERT
+              </button>
+              <button className="btn btn-success" onClick={handleRestoreFiles}>
+                ⚡ RECOVER FILES
+              </button>
+              <button className="btn" onClick={handleReset}>
+                ⚙️ RESET EDR
               </button>
             </div>
           </div>

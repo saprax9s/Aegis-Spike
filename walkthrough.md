@@ -112,7 +112,7 @@ To guarantee maximum protection with minimal false-positives, the Aegis-Spike ED
 
 > [!IMPORTANT]
 > **Active Lockdown Condition**:
-> `Lockdown Active = Gate 1 (Error Spike) AND (Gate 2a (Z-Score > 4.0) OR Gate 2b (Entropy Shift > 0.4))`
+> `Lockdown Active = Gate 2a (Z-Score > 4.0) OR (Gate 1 (Error Spike) AND Gate 2b (Entropy Shift > 0.4))`
 >
 > When this logic resolves to `True`, the backend engages the shield, blocks further socket client traffic, and holds file changes in a safe quarantine isolation loop.
 
